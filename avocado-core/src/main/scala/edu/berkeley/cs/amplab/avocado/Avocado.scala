@@ -28,7 +28,7 @@ import edu.berkeley.cs.amplab.adam.avro.{ADAMPileup,
                                          ADAMRecord, 
                                          ADAMVariant, 
                                          ADAMGenotype, 
-                                         ADAMFastaNucleotideContig}
+                                         ADAMNucleotideContig}
 import edu.berkeley.cs.amplab.adam.cli.{AdamSparkCommand, 
                                         AdamCommandCompanion, 
                                         ParquetArgs, 
@@ -39,6 +39,7 @@ import edu.berkeley.cs.amplab.adam.models.{ADAMRod, ADAMVariantContext, Referenc
 import edu.berkeley.cs.amplab.adam.predicates.LocusPredicate
 import edu.berkeley.cs.amplab.adam.rdd.AdamContext._ 
 import edu.berkeley.cs.amplab.avocado.calls.{VariantCall, VariantCaller}
+import edu.berkeley.cs.amplab.avocado.input.Input
 import edu.berkeley.cs.amplab.avocado.partitioners.Partitioner
 import edu.berkeley.cs.amplab.avocado.preprocessing.Preprocessor
 import edu.berkeley.cs.amplab.avocado.postprocessing.Postprocessor
@@ -230,15 +231,16 @@ class Avocado (protected val args: AvocadoArgs) extends AdamSparkCommand [Avocad
 
     println("Starting avocado...")
     println("Loading reads in from " + args.readInput)
-    
-    // load in reads from ADAM file
-    val reads: RDD[ADAMRecord] = sc.adamLoad(args.readInput, Some(classOf[LocusPredicate]))
 
     // load in reference from ADAM file
-    val reference: RDD[ADAMFastaNucleotideContig] = sc.adamLoad(args.referenceInput)
+    val reference: RDD[ADAMNucleotideContig] = sc.adamLoad(args.referenceInput)
 
     // create stats/config item
-    val stats = new AvocadoConfigAndStats(sc, args.debug, reads, reference)
+    val stats = new AvocadoConfigAndStats(sc, args.debug, reference)
+    
+    // load in reads from ADAM file
+    val reads : RDD[ADAMRecord] = Input(args.readInput, config, stats)
+    stats.attachReads(reads)
 
     // apply read translation steps
     println("Processing reads.")
