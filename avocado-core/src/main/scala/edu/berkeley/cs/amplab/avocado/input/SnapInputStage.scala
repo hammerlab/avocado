@@ -19,12 +19,12 @@ package edu.berkeley.cs.amplab.avocado.input
 import edu.berkeley.cs.amplab.adam.avro.ADAMRecord
 import edu.berkeley.cs.amplab.adam.converters.SAMRecordConverter
 import edu.berkeley.cs.amplab.adam.io.InterleavedFastqInputFormat
+import edu.berkeley.cs.amplab.adam.rdd.AdamContext._
 import edu.berkeley.cs.amplab.adam.models.RecordGroupDictionary
 import edu.berkeley.cs.amplab.avocado.stats.AvocadoConfigAndStats
 import fi.tkk.ics.hadoop.bam.SAMRecordWritable
 import java.io.OutputStream
-import java.lang.{Thread, Runnable}
-import java.util.concurrent.{FutureTask, Callable}
+import java.util.concurrent.{Future, ExecutorService, Executors, Callable}
 import org.apache.commons.configuration.SubnodeConfiguration
 import org.apache.hadoop.io.{LongWritable, Text}
 import org.apache.hadoop.mapreduce.lib.input.TextInputFormat
@@ -230,18 +230,21 @@ private[input] class SnapRunner (cmd: List[String]) extends Serializable {
   println(cmd.reduce(_ + " " + _))
 
   class SnapWriter(fastqStrings: Iterator[String],
-                   stream: OutputStream) extends Runnable {
-    def run () {
+                   stream: OutputStream) extends Callable[List[SAMRecordWritable]] {
+    def call (): List[SAMRecordWritable] = {
       // cram data into standard in and flush
       fastqStrings.foreach(s => stream.write(s.getBytes))
       stream.flush()
+
+      // this is a hack
+      List[SAMRecordWritable]()
     }
   }
 
   class SnapReader(iter: SAMRecordIterator) 
-    extends Callable[Iterator[SAMRecordWritable]] {
+    extends Callable[List[SAMRecordWritable]] {
     
-    def call (): Iterator[SAMRecordWritable] = {    
+    def call (): List[SAMRecordWritable] = {    
       var writableRecords = List[SAMRecordWritable]()
       
       // loop through our poor iterator
@@ -252,7 +255,7 @@ private[input] class SnapRunner (cmd: List[String]) extends Serializable {
         writableRecords ::= rw
       }
 
-      writableRecords.toIterator
+      writableRecords
     }
   }
 
@@ -278,21 +281,20 @@ private[input] class SnapRunner (cmd: List[String]) extends Serializable {
     // get iterator from sam file reader
     val iter: SAMRecordIterator = reader.iterator()
 
-    // launch writer thread
-    val t = new Thread(new SnapWriter(fastqStrings, in))
+    // get thread pool with two threads
+    val pool: ExecutorService = Executors.newFixedThreadPool(2)
 
-    // get reader future
-    val f = new FutureTask(new SnapReader(iter))
+    // build java list of things to execute
+    val exec: java.util.List[Callable[List[SAMRecordWritable]]] = List(new SnapWriter(fastqStrings, in),
+                                                                       new SnapReader(iter))
 
-    // close after writing to snap finishes
-    t.join()
-    in.close()
+    // launch writer and reader in pool
+    val futures: List[Future[List[SAMRecordWritable]]] = pool.invokeAll(exec)
 
     // get read data
-    val records = f.get()
-
-    // wait for process to end
-    process.waitFor()
+    val records = futures.map(_.get())
+      .reduce(_ ++ _)
+      .toIterator
       
     // close iterator, because that makes god damn sense
     iter.close()
