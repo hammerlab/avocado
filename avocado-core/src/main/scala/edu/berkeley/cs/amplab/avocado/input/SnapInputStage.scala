@@ -23,7 +23,7 @@ import edu.berkeley.cs.amplab.adam.rdd.AdamContext._
 import edu.berkeley.cs.amplab.adam.models.RecordGroupDictionary
 import edu.berkeley.cs.amplab.avocado.stats.AvocadoConfigAndStats
 import fi.tkk.ics.hadoop.bam.SAMRecordWritable
-import java.io.OutputStream
+import java.io.{OutputStream, InputStream, InputStreamReader}
 import java.util.concurrent.{Future, ExecutorService, Executors, Callable}
 import org.apache.commons.configuration.SubnodeConfiguration
 import org.apache.hadoop.io.{LongWritable, Text}
@@ -52,8 +52,10 @@ private[input] object SnapInputStage extends InputStage {
     // build list of options
     // -M is included by default because ADAM assumes alignment match in cigar
     var cmdOpts: List[Option[String]] = List(Some("-M"),
+                                             Some("-"),
                                              Some("-bam"),
                                              Some("-o"),
+                                             Some("-"),
                                              Some("-pairedInterleavedFastq"),
                                              Some(config.getString("indexDirectory")),
                                              Some("paired"),
@@ -232,8 +234,21 @@ private[input] class SnapRunner (cmd: List[String]) extends Serializable {
   class SnapWriter(fastqStrings: Iterator[String],
                    stream: OutputStream) extends Callable[List[SAMRecordWritable]] {
     def call (): List[SAMRecordWritable] = {
+
+      var count = 0
+      println("Starting to write records.")
+      
       // cram data into standard in and flush
-      fastqStrings.foreach(s => stream.write(s.getBytes))
+      fastqStrings.foreach(s => {
+        if (count % 1000 == 0) {
+          println("Have written " + count + " reads.")
+          stream.flush()
+        }
+
+        count += 1
+
+        stream.write(s.getBytes)
+      })
       stream.flush()
 
       // this is a hack
@@ -241,19 +256,38 @@ private[input] class SnapRunner (cmd: List[String]) extends Serializable {
     }
   }
 
-  class SnapReader(iter: SAMRecordIterator) 
+  class SnapReader(stream: InputStream) 
     extends Callable[List[SAMRecordWritable]] {
     
     def call (): List[SAMRecordWritable] = {    
+      println("Starting reader.")
+
+      // push std out from snap into sam file reader
+      val reader = new SAMFileReader(stream)
+      
+      // get iterator from sam file reader
+      val iter: SAMRecordIterator = reader.iterator()
+
+      var count = 0 
+      println("Starting to read records.")
+
       var writableRecords = List[SAMRecordWritable]()
       
       // loop through our poor iterator
       while (iter.hasNext()) {
+        if (count % 1000 == 0) {
+          println("Have read " + count + " aligned reads.")
+        }
+
+        count += 1
         val rw = new SAMRecordWritable()
         rw.set(iter.next())
         
         writableRecords ::= rw
       }
+      
+      // close iterator, because that makes god damn sense
+      iter.close()
 
       writableRecords
     }
@@ -270,23 +304,25 @@ private[input] class SnapRunner (cmd: List[String]) extends Serializable {
   def mapReads(fastqStrings: Iterator[String]): Iterator[SAMRecordWritable] = {
     // build snap process
     val pb = new ProcessBuilder(cmd)
+    
+    // redirect error and get i/o streams
+    pb.redirectError(ProcessBuilder.Redirect.INHERIT)
+
+    // start process and get pipes
+    println("Starting SNAP...")
     val process = pb.start()
-
-    // get std in for snap
-    val in = process.getOutputStream()
-
-    // get std out from snap and push into sam file reader
-    val reader = new SAMFileReader(process.getInputStream())
-
-    // get iterator from sam file reader
-    val iter: SAMRecordIterator = reader.iterator()
+    println("SNAP is started.")
+    val inp = process.getOutputStream()
+    val out = process.getInputStream()
+    println("Have pipes.")
 
     // get thread pool with two threads
     val pool: ExecutorService = Executors.newFixedThreadPool(2)
 
     // build java list of things to execute
-    val exec: java.util.List[Callable[List[SAMRecordWritable]]] = List(new SnapWriter(fastqStrings, in),
-                                                                       new SnapReader(iter))
+    println("Starting reader and writer.")
+    val exec: java.util.List[Callable[List[SAMRecordWritable]]] = List(new SnapWriter(fastqStrings, inp),
+                                                                       new SnapReader(out))
 
     // launch writer and reader in pool
     val futures: List[Future[List[SAMRecordWritable]]] = pool.invokeAll(exec)
@@ -295,9 +331,9 @@ private[input] class SnapRunner (cmd: List[String]) extends Serializable {
     val records = futures.map(_.get())
       .reduce(_ ++ _)
       .toIterator
-      
-    // close iterator, because that makes god damn sense
-    iter.close()
+
+    // shut down pool
+    pool.shutdown()
 
     records
   }
